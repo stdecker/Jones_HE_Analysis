@@ -1,0 +1,599 @@
+# Jones batch processing in Colab
+
+#@title Mount & Install
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip -q install "monai[tqdm]" tifffile opencv-python scikit-image imagecodecs albumentations==1.3.1 pandas
+
+
+#@title Paths & classes (configured for your setup)
+import os, numpy as np
+
+# Batch WSIs to process
+BASE_DIR = ""
+WSI_DIR  = f"{BASE_DIR}/Images"
+
+# Training workspace (tiles + checkpoint)
+WORK_DIR = ""
+# Tiles created during training
+TILES_IMG = f"{WORK_DIR}/tiles/images"
+TILES_MSK = f"{WORK_DIR}/tiles/masks"
+CKPT_PATH = f"{WORK_DIR}/unet_jones_best.pt"
+
+# Outputs
+DEST_DIR  = f"{BASE_DIR}/pred_wsis"
+os.makedirs(DEST_DIR, exist_ok=True)
+
+# Canonical classes — must match training
+CLASS_NAMES = ["PT","Glom","DT","CollectingDuct","Background","Vessel","NA_Cells"]
+NUM_CLASSES = len(CLASS_NAMES)
+NAME2IDX = {n:i for i,n in enumerate(CLASS_NAMES)}
+BACKGROUND_ID = NAME2IDX["Background"]
+
+# Visualization palette
+PALETTE = np.array([
+  [0, 0, 0],   # PT
+  [  0,255,0],   # Glom
+  [  0, 0,255],  # DT
+  [255, 0,255],  # CollectingDuct
+  [  255, 0, 0],   # Background
+  [255,255, 0],  # Vessel
+  [  0,255,255], # NA_Cells
+], dtype=np.uint8)
+
+
+#@title Utility funcs (I/O, color, overlays, despeckle)
+import cv2, tifffile as tiff
+
+def to_hwc3(img: np.ndarray) -> np.ndarray:
+  if img.ndim == 2:
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+  elif img.ndim == 3:
+    if img.shape[0] in (3,4) and img.shape[-1] not in (3,4):
+      img = np.transpose(img, (1,2,0))
+    if img.shape[-1] > 3: img = img[..., :3]
+    if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+  return np.clip(img, 0, 255).astype(np.uint8)
+
+def colorize_mask(label_2d: np.ndarray) -> np.ndarray:
+  lab = np.clip(label_2d.astype(np.int64), 0, PALETTE.shape[0]-1)
+  return PALETTE[lab]
+
+def overlay_masked(wsi_u8: np.ndarray, rgb_u8: np.ndarray, pred_u8: np.ndarray, bg_idx: int, alpha: float = 0.35) -> np.ndarray:
+  wsi_f = wsi_u8.astype(np.float32)
+  rgb_f = rgb_u8.astype(np.float32)
+  out   = wsi_f.copy()
+  mask  = (pred_u8 != bg_idx)
+  out[mask] = (1.0 - alpha) * wsi_f[mask] + alpha * rgb_f[mask]
+  return np.clip(out, 0, 255).astype(np.uint8)
+
+def majority_filter_labels(pred: np.ndarray, ksize: int = 3) -> np.ndarray:
+  kernel = np.ones((ksize, ksize), dtype=np.uint8)
+  H, W = pred.shape
+  scores = np.zeros((NUM_CLASSES, H, W), dtype=np.int32)
+  for c in range(NUM_CLASSES):
+    m = (pred == c).astype(np.uint8)
+    scores[c] = cv2.filter2D(m, -1, kernel, borderType=cv2.BORDER_REPLICATE)
+  return np.argmax(scores, axis=0).astype(np.uint8)
+
+def remove_small_islands(pred: np.ndarray, min_area_map: dict, bg_idx: int) -> np.ndarray:
+  out = pred.copy()
+  for cname, min_area in min_area_map.items():
+    c = NAME2IDX[cname]
+    if min_area <= 1:
+      continue
+    mask = (out == c).astype(np.uint8)
+    num, lbl = cv2.connectedComponents(mask, connectivity=8)
+    if num <= 1:
+      continue
+    areas = np.bincount(lbl.ravel())
+    small_ids = np.where(areas < min_area)[0]
+    if len(small_ids) > 0:
+      rm = np.isin(lbl, small_ids).astype(np.uint8)
+      out[rm == 1] = bg_idx
+  return out
+
+
+#@title Load UNet & weights (STRICT)
+import torch
+from monai.networks.nets import UNet
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+# Speed toggles
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+  torch.set_float32_matmul_precision('high')
+except Exception:
+  pass
+
+# Fresh, uncompiled UNet for inference
+infer_model = UNet(
+    spatial_dims=2, in_channels=3, out_channels=NUM_CLASSES,
+    channels=(32,64,128,256,512), strides=(2,2,2,2)
+).to(device).eval()
+
+# --- STRICT checkpoint load; fail loudly if mismatch ---
+sd = torch.load(CKPT_PATH, map_location="cpu")
+if isinstance(sd, dict) and 'state_dict' in sd and all(isinstance(k, str) for k in sd['state_dict'].keys()):
+  sd = sd['state_dict']
+
+def _strip_prefix(sd_dict, prefix):
+  if any(k.startswith(prefix) for k in sd_dict.keys()):
+    return { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in sd_dict.items() }
+  return sd_dict
+
+sd = _strip_prefix(sd, "_orig_mod.")
+sd = _strip_prefix(sd, "module.")
+
+missing, unexpected = infer_model.load_state_dict(sd, strict=True)  # strict=True
+print("Loaded weights from:", CKPT_PATH)
+if missing or unexpected:
+  raise RuntimeError(f"State dict mismatch — missing: {missing}, unexpected: {unexpected}")
+
+
+# Rebuild validation dataloader (va_dl) from tiles
+import os, glob, cv2, tifffile as tiff, torch
+import albumentations as A
+from torch.utils.data import Dataset, DataLoader
+
+# Pair tiles
+img_map = {os.path.basename(p): p for p in glob.glob(f"{TILES_IMG}/*.tif")}
+msk_map = {os.path.basename(p): p for p in glob.glob(f"{TILES_MSK}/*.tif")}
+common  = sorted(set(img_map) & set(msk_map))
+all_imgs = [img_map[k] for k in common]
+all_msks = [msk_map[k] for k in common]
+
+def slide_of(p: str) -> str:
+    return os.path.basename(p).split("_")[0]
+
+# slide-level split (same ratio as before)
+by_slide = {}
+for i, p in enumerate(all_imgs):
+    by_slide.setdefault(slide_of(p), []).append(i)
+
+slide_ids = sorted(by_slide)
+cut = max(1, int(0.75 * len(slide_ids)))
+train_idx = sum([by_slide[s] for s in slide_ids[:cut]], [])
+val_idx   = sum([by_slide[s] for s in slide_ids[cut:]], [])
+
+class JonesTiles(Dataset):
+    def __init__(self, idxs, aug=None):
+        self.idxs, self.aug = idxs, aug
+    def __len__(self): return len(self.idxs)
+    def __getitem__(self, k):
+        i = self.idxs[k]
+        x = tiff.imread(all_imgs[i])
+        if x.ndim==2:
+            x = cv2.cvtColor(x, cv2.COLOR_GRAY2RGB)
+        elif x.shape[-1] > 3:
+            x = x[...,:3]
+        y = tiff.imread(all_msks[i]).astype(np.uint8)
+        if self.aug is not None:
+            out = self.aug(image=x, mask=y)
+            x, y = out["image"], out["mask"]
+        x = (x.astype(np.float32)/255.).transpose(2,0,1)
+        return torch.from_numpy(x), torch.from_numpy(y.astype(np.int64))
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH = 16 if device.type=="cuda" else 4
+
+va_dl = DataLoader(JonesTiles(val_idx, None),
+                   batch_size=BATCH, shuffle=False,
+                   num_workers=2 if device.type=="cuda" else 0,
+                   pin_memory=(device.type=="cuda"))
+print("Validation loader ready:", len(val_idx), "tiles")
+
+
+#@title Global temperature calibration (coarse→fine grid, no LBFGS)
+import os, json, math, torch, numpy as np, torch.nn.functional as F
+from tqdm import tqdm
+
+CALIB_PATH = os.path.join(WORK_DIR, "temperature.json")
+
+# --- 1) Collect validation logits (rebuild if missing) ---
+def _collect_val_logits_safely(model, va_dl, max_batches=120):
+    model.eval()
+    Ls, Ys = [], []
+    with torch.no_grad():
+        for bi, (xb, yb) in enumerate(tqdm(va_dl, desc="Collect val logits")):
+            xb = xb.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+            yb = yb.to("cpu", non_blocking=True).long()  # keep y on CPU
+            lg = model(xb).detach().cpu()                # move logits to CPU to free VRAM
+            Ls.append(lg); Ys.append(yb)
+            if bi+1 >= max_batches: break
+    return torch.cat(Ls, 0), torch.cat(Ys, 0)
+
+try:
+    val_logits, val_y  # use existing if present
+except NameError:
+    val_logits, val_y = _collect_val_logits_safely(infer_model, va_dl, max_batches=120)
+
+# --- 2) Optional subsample for speed (keeps it unbiased) ---
+C = val_logits.shape[1]
+logits_flat = val_logits.permute(0,2,3,1).reshape(-1, C)  # [N, C]
+y_flat      = val_y.reshape(-1)                           # [N]
+
+N = logits_flat.shape[0]
+TARGET_SAMPLES = 400_000  # tune for speed vs accuracy
+if N > TARGET_SAMPLES:
+    idx = torch.randperm(N)[:TARGET_SAMPLES]
+    logits_flat = logits_flat[idx]
+    y_flat      = y_flat[idx]
+
+logits_flat = logits_flat.contiguous()
+y_flat      = y_flat.contiguous()
+
+# --- 3) Coarse→fine grid search for T in [0.5, 5.0] ---
+def nll_at_T(Tval: float) -> float:
+    # Compute mean CE on CPU in manageable chunks to reduce RAM spikes
+    B = 200_000
+    total = 0.0
+    seen  = 0
+    for s in range(0, logits_flat.shape[0], B):
+        e = min(s+B, logits_flat.shape[0])
+        lg = logits_flat[s:e] / Tval
+        loss = F.cross_entropy(lg, y_flat[s:e], reduction="sum")  # sum to avoid FP error
+        total += float(loss)
+        seen  += (e - s)
+    return total / max(1, seen)
+
+# Coarse grid
+Ts = np.linspace(0.5, 5.0, 19)  # 0.5, 0.75, ..., 5.0
+coarse = [(float(t), nll_at_T(float(t))) for t in Ts]
+T_best, loss_best = min(coarse, key=lambda x: x[1])
+
+# Fine grid around best
+low  = max(0.5, T_best - 0.5)
+high = min(5.0, T_best + 0.5)
+Ts2  = np.linspace(low, high, 21)
+fine = [(float(t), nll_at_T(float(t))) for t in Ts2]
+T_opt, lossT = min(fine, key=lambda x: x[1])
+
+# Baseline at T=1 for reporting
+loss1 = nll_at_T(1.0)
+
+with open(CALIB_PATH, "w") as f:
+    json.dump({"temperature": float(T_opt)}, f)
+
+print(f"NLL@T=1.0: {loss1:.4f}  →  NLL@T={T_opt:.3f}: {lossT:.4f}  (samples used: {logits_flat.shape[0]:,})")
+print("Saved temperature →", CALIB_PATH)
+
+
+#@title Inference over batch WSIs (unbiased) + hann + tiny hole-fill + 1px grow
+import os, gc, glob, json
+import numpy as np, cv2, tifffile as tiff, torch, pandas as pd
+from tqdm import tqdm
+
+with open(os.path.join(WORK_DIR, "temperature.json"), "r") as f:
+    T_CONST = float(json.load(f)["temperature"])
+print("Using global temperature:", T_CONST)
+
+def to_hwc3(img: np.ndarray) -> np.ndarray:
+  if img.ndim == 2:
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR); img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # ensure 3ch
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+  elif img.ndim == 3:
+    if img.shape[0] in (3,4) and img.shape[-1] not in (3,4):
+      img = np.transpose(img, (1,2,0))
+    if img.shape[-1] > 3: img = img[..., :3]
+    if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+  return np.clip(img, 0, 255).astype(np.uint8)
+
+def colorize_mask(label_2d: np.ndarray) -> np.ndarray:
+  lab = np.clip(label_2d.astype(np.int64), 0, PALETTE.shape[0]-1)
+  return PALETTE[lab]
+
+def overlay_masked(wsi_u8: np.ndarray, rgb_u8: np.ndarray, pred_u8: np.ndarray, bg_idx: int, alpha: float = 0.35) -> np.ndarray:
+  wsi_f = wsi_u8.astype(np.float32)
+  rgb_f = rgb_u8.astype(np.float32)
+  out   = wsi_f.copy()
+  mask  = (pred_u8 != bg_idx)
+  out[mask] = (1.0 - alpha) * wsi_f[mask] + alpha * rgb_f[mask]
+  return np.clip(out, 0, 255).astype(np.uint8)
+
+def _tta_forward(xt):
+    # xt: [B,3,H,W], FP32; apply same global temperature to all tiles
+    def fwd(x): return infer_model(x) / T_CONST
+    outs = []
+    outs.append(torch.softmax(fwd(xt), dim=1))
+    outs.append(torch.flip(torch.softmax(fwd(torch.flip(xt, dims=[-1])), dim=1), dims=[-1]))  # hflip
+    outs.append(torch.flip(torch.softmax(fwd(torch.flip(xt, dims=[-2])), dim=1), dims=[-2]))  # vflip
+    outs.append(torch.rot90(torch.softmax(fwd(torch.rot90(xt,  k=1, dims=[-2,-1])), dim=1),  k=3, dims=[-2,-1]))
+    outs.append(torch.rot90(torch.softmax(fwd(torch.rot90(xt,  k=3, dims=[-2,-1])), dim=1),  k=1, dims=[-2,-1]))
+    return torch.stack(outs, dim=0).mean(0)
+
+# --- unbiased post: (a) fill tiny holes, (b) 1px grow into BG ---
+_kernel3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+
+def fill_tiny_holes_into_bg(pred: np.ndarray, bg_idx: int) -> np.ndarray:
+  out = pred.copy()
+  for c in range(NUM_CLASSES):
+      if c == bg_idx:
+          continue
+      m = (out == c).astype(np.uint8)
+      if m.any():
+          closed = cv2.morphologyEx(m, cv2.MORPH_CLOSE, _kernel3, iterations=1)
+          add = (closed == 1) & (out == bg_idx)
+          out[add] = c
+  return out
+
+import cv2
+import numpy as np
+
+# 3x3 kernel for neighbor counting
+_kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+
+def snap_bg_to_neighbor_majority(pred: np.ndarray, bg_idx: int, thresh: int = 5) -> np.ndarray:
+    """
+    For each class c != BG:
+      - Count, for every pixel, how many 8-neighbors belong to c (3x3 sum minus center).
+      - On pixels currently BG, if exactly one class reaches >= thresh neighbors,
+        snap that pixel to that class. Ties/none → leave BG.
+    This is class-agnostic and only fills BG; no overwriting other classes.
+    """
+    H, W = pred.shape
+    out = pred.copy()
+    # Precompute a mask of BG pixels we are allowed to change
+    bg_mask = (out == bg_idx)
+
+    # Accumulate neighbor counts per class into a small stack
+    # We’ll keep only the top-2 per pixel to resolve ties quickly
+    neighbor_counts = np.zeros((NUM_CLASSES, H, W), dtype=np.uint8)
+
+    for c in range(NUM_CLASSES):
+        if c == bg_idx:
+            continue
+        m = (out == c).astype(np.uint8)
+        # 3x3 sum includes center; subtract center to count *neighbors* only
+        neigh = cv2.filter2D(m, -1, _kernel3, borderType=cv2.BORDER_REPLICATE)
+        neigh = np.clip(neigh - m, 0, 8).astype(np.uint8)
+        neighbor_counts[c] = neigh
+
+    # For BG pixels only: find the winning class and its count
+    counts_flat = neighbor_counts.reshape(NUM_CLASSES, -1)
+    winner = counts_flat.argmax(axis=0).reshape(H, W)
+    win_count = neighbor_counts[winner, np.arange(H)[:,None], np.arange(W)[None,:]]
+
+    # Detect ties (two or more classes share the max at this pixel)
+    # We do this by checking how many classes equal the max per pixel.
+    is_max = (neighbor_counts == win_count)
+    max_ties = is_max.sum(axis=0)
+
+    # Snap condition: BG pixel, winner count >= thresh, and no tie (unique winner)
+    snap = bg_mask & (win_count >= thresh) & (max_ties == 1)
+    out[snap] = winner[snap].astype(out.dtype)
+
+    return out
+
+def grow_one_pixel_into_bg(pred: np.ndarray, bg_idx: int) -> np.ndarray:
+  """
+  For each class c != BG:
+    dil = dilate(mask(c), 3x3, 1 iter)
+    add = dil & (pred == BG)
+    assign those BG pixels to c
+  No overwriting between classes (BG only).
+  """
+  out = pred.copy()
+  for c in range(NUM_CLASSES):
+      if c == bg_idx:
+          continue
+      m = (out == c).astype(np.uint8)
+      if m.any():
+          dil = cv2.dilate(m, _kernel3, iterations=1)
+          add = (dil == 1) & (out == bg_idx)
+          out[add] = c
+  return out
+
+
+#@title Inference over batch WSIs (global T, TTA, Hann, holes+grow+snap)
+import os, gc, glob, json
+import numpy as np, cv2, tifffile as tiff, torch, pandas as pd
+from tqdm import tqdm
+
+# ---- Tunables (minimal change for gloms) ----
+TILE = 512
+OVERLAP = 384          # try 192 or 256; 256 (50%) is best for round structures
+START_BATCH_TILES = 8  # reduce if you see GPU OOM
+
+# Load global temperature
+with open(os.path.join(WORK_DIR, "temperature.json"), "r") as f:
+    T_CONST = float(json.load(f)["temperature"])
+print(f"Using global temperature: {T_CONST:.3f}")
+
+def to_hwc3(img: np.ndarray) -> np.ndarray:
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+    elif img.ndim == 3:
+        if img.shape[0] in (3,4) and img.shape[-1] not in (3,4):
+            img = np.transpose(img, (1,2,0))
+        if img.shape[-1] > 3: img = img[..., :3]
+        if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+def colorize_mask(label_2d: np.ndarray) -> np.ndarray:
+    lab = np.clip(label_2d.astype(np.int64), 0, PALETTE.shape[0]-1)
+    return PALETTE[lab]
+
+def overlay_masked(wsi_u8: np.ndarray, rgb_u8: np.ndarray, pred_u8: np.ndarray, bg_idx: int, alpha: float = 0.35) -> np.ndarray:
+    wsi_f = wsi_u8.astype(np.float32)
+    rgb_f = rgb_u8.astype(np.float32)
+    out   = wsi_f.copy()
+    mask  = (pred_u8 != bg_idx)
+    out[mask] = (1.0 - alpha) * wsi_f[mask] + alpha * rgb_f[mask]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+def _tta_forward(xt):
+    """Uniform TTA for all tiles; applies global temperature to logits."""
+    def fwd(x): return infer_model(x) / T_CONST
+    outs = []
+    outs.append(torch.softmax(fwd(xt), dim=1))  # id
+    outs.append(torch.flip(torch.softmax(fwd(torch.flip(xt, dims=[-1])), dim=1), dims=[-1]))  # hflip
+    outs.append(torch.flip(torch.softmax(fwd(torch.flip(xt, dims=[-2])), dim=1), dims=[-2]))  # vflip
+    outs.append(torch.rot90(torch.softmax(fwd(torch.rot90(xt,  k=1, dims=[-2,-1])), dim=1),  k=3, dims=[-2,-1]))
+    outs.append(torch.rot90(torch.softmax(fwd(torch.rot90(xt,  k=3, dims=[-2,-1])), dim=1),  k=1, dims=[-2,-1]))
+    return torch.stack(outs, dim=0).mean(0)
+
+@torch.inference_mode()
+def infer_wsi(slide_path: str, start_batch: int = START_BATCH_TILES):
+    sid = os.path.splitext(os.path.basename(slide_path))[0]
+    out_pred    = os.path.join(DEST_DIR, f"{sid}_pred.tif")
+    out_rgb     = os.path.join(DEST_DIR, f"{sid}_pred_rgb.tif")
+    out_overlay = os.path.join(DEST_DIR, f"{sid}_overlay.tif")
+    out_json    = os.path.join(DEST_DIR, f"{sid}_meta.json")
+
+    # Skip if already done
+    if all(os.path.exists(p) for p in [out_pred, out_rgb, out_overlay]):
+        print(f"[SKIP] {sid} (already exists)")
+        return sid, None
+
+    img = to_hwc3(tiff.imread(slide_path))
+    H, W = img.shape[:2]
+
+    # --- stride/overlap safety ---
+    ov = int(OVERLAP)
+    if ov >= TILE:
+        print(f"[WARN] OVERLAP({ov}) >= TILE({TILE}); clamping to TILE-1")
+        ov = TILE - 1
+    STEP = max(1, TILE - ov)
+
+    # Hann window (seam smoothing)
+    win_1d = np.hanning(TILE).astype(np.float32)
+    win = np.outer(win_1d, win_1d)
+    win = (win - win.min()) / (win.max() - win.min() + 1e-8) + 1e-3
+
+    BATCH_TILES = max(1, min(start_batch, 8))
+    coords = [(y, x) for y in range(0, max(1, H), STEP) for x in range(0, max(1, W), STEP)]
+    prob = np.zeros((NUM_CLASSES, H, W), dtype=np.float32)
+    wacc = np.zeros((H, W), dtype=np.float32)
+    tiles_np = np.empty((BATCH_TILES, 3, TILE, TILE), dtype=np.float32)
+    pads = [None] * BATCH_TILES
+
+    print(f"[{sid}] dev={device.type} TILE={TILE} OVERLAP={ov} BATCH_TILES={BATCH_TILES} size={H}x{W} (hann + holes + grow + snap)")
+    for i in tqdm(range(0, len(coords), BATCH_TILES), desc=f"Infer {sid}"):
+        batch = coords[i:i+BATCH_TILES]
+        for j, (y, x) in enumerate(batch):
+            t = img[y:y+TILE, x:x+TILE]
+            pad = ((0,0), (0,0), (0,0))
+            if t.shape[0] < TILE or t.shape[1] < TILE:
+                pad = ((0, TILE - t.shape[0]), (0, TILE - t.shape[1]), (0, 0))
+                t = np.pad(t, pad, mode='constant')
+            tiles_np[j] = (t.astype(np.float32) / 255.).transpose(2, 0, 1)
+            pads[j] = pad
+
+        xt = torch.from_numpy(tiles_np[:len(batch)]).to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+        prs = _tta_forward(xt).float().cpu().numpy()  # [B,C,H,W]
+
+        for (y, x), pr, pad in zip(batch, prs, pads):
+            h = TILE - pad[0][1]; w = TILE - pad[1][1]
+            winc = win[:h, :w]
+            prob[:, y:y+h, x:x+w] += pr[:, :h, :w] * winc
+            wacc[y:y+h, x:x+w]    += winc
+
+        del xt
+        if device.type == 'cuda': torch.cuda.empty_cache()
+        else: gc.collect()
+
+    wacc[wacc == 0] = 1.0
+    probs = prob / wacc[None]
+    pred = probs.argmax(axis=0).astype(np.uint8)
+
+    # ---- Minimal, class-agnostic refinements (order matters) ----
+    pred = fill_tiny_holes_into_bg(pred, bg_idx=BACKGROUND_ID)
+    pred = grow_one_pixel_into_bg(pred,   bg_idx=BACKGROUND_ID)
+    pred = snap_bg_to_neighbor_majority(pred, bg_idx=BACKGROUND_ID, thresh=6)
+
+    # Save artifacts
+    tiff.imwrite(out_pred, pred, compression='zlib')
+    rgb = colorize_mask(pred)
+    tiff.imwrite(out_rgb, rgb, compression='zlib')
+    overlay = overlay_masked(img, rgb, pred, bg_idx=BACKGROUND_ID, alpha=0.35)
+    tiff.imwrite(out_overlay, overlay, compression='zlib')
+
+    # Meta + counts (for your summary CSV)
+    u, cts = np.unique(pred, return_counts=True)
+    stats = { CLASS_NAMES[int(k)]: int(v) for k, v in zip(u, cts) }
+    meta = {
+        "slide_id": sid,
+        "shape": [int(H), int(W)],
+        "counts": stats,
+        "percent": {k: (v / float(H*W))*100.0 for k, v in stats.items()},
+        "params": {
+            "tile": TILE, "overlap": ov, "batch_tiles": int(BATCH_TILES),
+            "temperature": float(T_CONST), "tta": "flip+rot", "window": "hann",
+            "postprocess": "fill_holes(3x3)+grow1px(BG-only)+neighbor_snap(thresh=5)"
+        }
+    }
+    with open(out_json, "w") as f: json.dump(meta, f, indent=2)
+
+    print(f"[DONE] {sid} → {out_pred}")
+    return sid, meta
+
+
+#@title Run batch & summarize
+# Robust run loop: accepts infer_wsi() returning either `sid` or `(sid, meta)`
+import os, json, glob, numpy as np, tifffile as tiff, pandas as pd
+
+slides = sorted(glob.glob(os.path.join(WSI_DIR, "*.tif"))) + \
+         sorted(glob.glob(os.path.join(WSI_DIR, "*.tiff")))
+assert slides, f"No WSIs found in {WSI_DIR}"
+
+def _ensure_meta_for_sid(sid):
+    """Create/load meta for a slide id by reading its pred mask if needed."""
+    meta_path = os.path.join(DEST_DIR, f"{sid}_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            return json.load(f)
+
+    pred_p = os.path.join(DEST_DIR, f"{sid}_pred.jpg")
+    assert os.path.exists(pred_p), f"Missing prediction: {pred_p}"
+    y = tiff.imread(pred_p).squeeze()
+    H, W = y.shape[:2]
+    u, cts = np.unique(y, return_counts=True)
+    stats = { CLASS_NAMES[int(k)]: int(v) for k, v in zip(u, cts) }
+    meta = {
+        "slide_id": sid,
+        "shape": [int(H), int(W)],
+        "counts": stats,
+        "percent": {k: (v / float(H*W))*100.0 for k, v in stats.items()},
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
+    return meta
+
+rows = []
+for sp in slides:
+    ret = infer_wsi(sp)
+    if isinstance(ret, tuple):   # newer infer_wsi returns (sid, meta)
+        sid, meta = ret
+        if meta is None:  # skipped slide
+            meta = _ensure_meta_for_sid(sid)
+    else:                 # older infer_wsi returns just sid
+        sid = ret
+        meta = _ensure_meta_for_sid(sid)
+
+    H, W = meta["shape"]; total_px = H * W
+    row = {"slide_id": sid, "H": H, "W": W, "pixels": total_px}
+    for name in CLASS_NAMES:
+        n = meta["counts"].get(name, 0)
+        p = meta["percent"].get(name, n / total_px * 100.0)
+        row[f"{name}_px"]  = n
+        row[f"{name}_pct"] = p
+    rows.append(row)
+
+df = pd.DataFrame(rows).sort_values("slide_id").reset_index(drop=True)
+summary_csv = os.path.join(DEST_DIR, "summary_per_slide.csv")
+df.to_csv(summary_csv, index=False)
+print(f"Saved per-slide summary → {summary_csv}")
+
+# Global distribution printout
+totals = {name: int(df[f"{name}_px"].sum()) for name in CLASS_NAMES}
+grand  = int(df["pixels"].sum()) if len(df) else 1
+print("\n--- Global predicted distribution ---")
+for i, name in enumerate(CLASS_NAMES):
+    n = totals[name]; pct = 100.0 * n / grand
+    print(f"{i:2d} {name:16s} {n:>12d} ({pct:6.3f}%)")
