@@ -1,0 +1,569 @@
+# Jones Quantification
+
+!pip -q install opencv-python-headless scikit-image tifffile numpy pandas matplotlib
+
+import os, glob, math, re
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+import cv2
+import matplotlib.pyplot as plt
+
+from skimage import measure, morphology
+from skimage.filters import threshold_otsu, sato
+from skimage.morphology import disk
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+#@title Paths and Class Map (HARD-CODED IDs)
+import os, numpy as np, torch
+
+# --- Your paths ---
+BASE_DIR = ""
+WSI_DIR  = f"{BASE_DIR}/Images/"        # 5x slides (RGB)
+DEST_DIR = f"{BASE_DIR}/pred_wsis"   # model outputs (multi-class masks + overlays)
+GBM_CSV  = f"{DEST_DIR}/GBM_summary_per_glomerulus.csv"
+
+# Where to save GBM overlays (kept separate from your model overlays)
+OUT_DIR  = f"{DEST_DIR}/GBM_outputs"
+os.makedirs(f"{OUT_DIR}/overlays", exist_ok=True)
+
+# --- Scale (μm/pixel at 5×). Set to None to keep pixel units
+MPP_5X = 0.88  # e.g., 1.3
+
+# --- Your mask class order: [0 BG, 1 Glom, 2 PT, 3 DT, 4 CD, 5 Vessel, 6 NA]
+MASK_IS_MULTICLASS = True
+GLOM_CLASS = 1
+
+MIN_CIRCULARITY   = 0.35        # 4πA/P^2
+# Literature-anchored glomerular tuft size (mouse): ~70–140 µm equivalent diameter
+MIN_EQ_DIAM_UM    = 50
+MAX_EQ_DIAM_UM    = 500
+ENFORCE_SHAPE_FILTERS = False   # keep all rows but flag shape_pass; set True to drop failing gloms
+
+# Derive pixel-area gates if MPP_5X known, else conservative fallback tuned for ~1.3 µm/px
+if MPP_5X is not None:
+    MIN_GLOM_AREA_PX = int(round(math.pi * ((MIN_EQ_DIAM_UM/(2*MPP_5X))**2)))
+    MAX_GLOM_AREA_PX = int(round(math.pi * ((MAX_EQ_DIAM_UM/(2*MPP_5X))**2)))
+else:
+    MIN_GLOM_AREA_PX = 2200
+    MAX_GLOM_AREA_PX = 9100
+
+print("Area gates (px):", MIN_GLOM_AREA_PX, "to", MAX_GLOM_AREA_PX)
+
+# ----------------------------
+# BM detection sensitivity
+# ----------------------------
+BM_SENS_MODE = "sensitive"  # "conservative" or "sensitive"
+
+SENS = {
+    "conservative": dict(max_chroma=20, l_quantile=0.30, sato_sigmas=(1.0,1.5,2.0),
+                         rid_min=0.10, min_obj_px=40, prune_min_len=12, use_clahe=False),
+    "sensitive":    dict(max_chroma=24, l_quantile=0.50, sato_sigmas=(0.8,1.0,1.5,2.0),
+                         rid_min=0.08, min_obj_px=25, prune_min_len=8, use_clahe=True)
+}
+
+# ----------------------------
+# ROI settings / testing knobs
+# ----------------------------
+ROI_PAD = 12                   # pixels to pad around each glom bbox
+MAX_GLOMS_PER_SLIDE = None     # e.g., 10 for quick test; None for all
+
+# Preserve true single-pixel GBM? (helps area; can be noisy for skeletons)
+PRESERVE_SINGLES_FOR_AREA = True
+
+
+IMG_EXTS  = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
+MASK_EXTS = {".tif", ".tiff", ".png", ".npy"}
+MASK_NAME_HINTS = ["mask", "mask_idx", "labels", "classes", "pred", "result", "mc", "multiclass"]
+
+def list_images(root_dir):
+    patterns = ["**/*.tif", "**/*.TIF", "**/*.tiff", "**/*.TIFF",
+                "**/*.png", "**/*.PNG", "**/*.jpg", "**/*.JPG", "**/*.jpeg", "**/*.JPEG"]
+    files = []
+    for pat in patterns:
+        files.extend(glob.glob(os.path.join(root_dir, pat), recursive=True))
+    files = [f for f in files if os.path.isfile(f)]
+    return sorted(files)
+
+def read_image_any(path):
+    ext = Path(path).suffix.lower()
+    if ext in [".tif", ".tiff"]:
+        img = tiff.imread(path)
+        if img.ndim == 3 and img.shape[0] in (3,4) and img.shape[0] < img.shape[-1]:
+            img = np.moveaxis(img, 0, -1)  # CHW -> HWC
+    else:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    if img.ndim == 2:
+        img = np.repeat(img[..., None], 3, axis=2)
+    elif img.shape[2] > 3:
+        img = img[..., :3]
+    return img
+
+def read_mask_any(path):
+    ext = Path(path).suffix.lower()
+    if ext == ".npy":
+        m = np.load(path)
+    else:
+        m = tiff.imread(path)
+        if m.ndim > 2 and not (m.shape[0] <= 64 and m.ndim == 3):
+            m = m[..., 0]  # reduce colored label TIFFs
+    return m
+
+def is_overlay_name(name_lower):
+    return ("overlay" in name_lower) or ("ovl" in name_lower)
+
+def likely_mask_name(name_lower):
+    if is_overlay_name(name_lower): return False
+    return any(h in name_lower for h in MASK_NAME_HINTS)
+
+def find_matching_mask(img_path, mask_dir=DEST_DIR):
+    img_stem = Path(img_path).stem.lower()
+    mask_dir = Path(mask_dir)
+    candidates = []
+    # strict
+    for p in mask_dir.rglob("*"):
+        if not p.is_file(): continue
+        if p.suffix.lower() not in MASK_EXTS: continue
+        nl = p.name.lower()
+        if not likely_mask_name(nl): continue
+        if nl.startswith(img_stem):
+            candidates.append(p)
+    # relaxed
+    if not candidates:
+        for p in mask_dir.rglob("*"):
+            if not p.is_file(): continue
+            if p.suffix.lower() not in MASK_EXTS: continue
+            nl = p.name.lower()
+            if not likely_mask_name(nl): continue
+            if img_stem in nl:
+                candidates.append(p)
+    candidates = sorted(candidates, key=lambda x: len(x.name))
+    return str(candidates[0]) if candidates else None
+
+
+def to_glom_binary(multiclass_mask, glom_class=GLOM_CLASS):
+    m = multiclass_mask
+    if m.ndim == 3:
+        # (H,W,C) or (C,H,W)
+        if m.shape[-1] <= 64:
+            lbl = np.argmax(m, axis=-1).astype(np.uint8)
+        elif m.shape[0] <= 64:
+            lbl = np.argmax(m, axis=0).astype(np.uint8)
+        else:
+            raise ValueError("3D mask but channels not in first/last position.")
+    else:
+        lbl = m.astype(np.uint8)
+
+    gl = (lbl == glom_class)
+    gl = morphology.remove_small_holes(gl, area_threshold=500)
+    gl = morphology.binary_closing(gl, disk(2))
+    gl = morphology.binary_dilation(gl, disk(1))
+    return (gl.astype(np.uint8) * 255)
+
+def label_glomeruli(glom_mask):
+    gm = glom_mask.astype(np.uint8)
+    if np.unique(gm).size <= 2:
+        labeled = measure.label(gm > 0, connectivity=2)
+    else:
+        uniq = np.unique(gm); uniq = uniq[uniq != 0]
+        labeled = np.zeros_like(gm, dtype=np.int32)
+        for i, val in enumerate(uniq, start=1):
+            labeled[gm == val] = i
+    return labeled
+
+def _safe_perimeter(region_mask, prop_perimeter=None):
+    per = 0.0
+    try:
+        if prop_perimeter is not None and np.isfinite(prop_perimeter) and prop_perimeter > 0:
+            per = float(prop_perimeter)
+    except Exception:
+        per = 0.0
+    if per <= 0.0:
+        try:
+            per = float(measure.perimeter(region_mask, neighborhood=8))
+        except TypeError:
+            try:
+                per = float(measure.perimeter(region_mask))
+            except Exception:
+                per = 0.0
+    if per <= 0.0:
+        try:
+            cnt_mask = (region_mask.astype(np.uint8) * 255)
+            contours, _ = cv2.findContours(cnt_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            per = sum(cv2.arcLength(c, True) for c in contours)
+        except Exception:
+            per = 0.0
+    return max(per, 1e-6)
+
+
+# H & E OD vectors (normalized)
+_HEMA = np.array([0.65, 0.70, 0.29], dtype=np.float32); _HEMA /= np.linalg.norm(_HEMA)
+_EOS  = np.array([0.07, 0.99, 0.11], dtype=np.float32); _EOS  /= np.linalg.norm(_EOS)
+
+def _rgb_to_od(rgb):
+    I = rgb.astype(np.float32)
+    return -np.log((I + 1.0) / 255.0)
+
+def _estimate_silver_vector(rgb, glom_mask_bool, max_chroma=20, l_quantile=0.30):
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    L, a, b = cv2.split(lab)
+    da = a.astype(np.float32) - 128.0
+    db = b.astype(np.float32) - 128.0
+    chroma = np.sqrt(da*da + db*db)
+    gmask = glom_mask_bool.astype(bool)
+
+    neutral = (chroma <= max_chroma) & gmask
+    if neutral.sum() < 50:
+        neutral = (chroma <= (max_chroma + 6)) & gmask
+    if neutral.sum() < 50:
+        return (np.array([1.0,1.0,1.0], dtype=np.float32) / np.sqrt(3.0))
+
+    Lg = L[neutral]
+    thr_L = np.quantile(Lg, l_quantile)
+    very_dark = neutral & (L <= thr_L)
+    if very_dark.sum() < 25:
+        very_dark = neutral
+
+    OD = _rgb_to_od(rgb)
+    od_sel = OD[very_dark]
+    v = np.mean(od_sel, axis=0)
+    n = np.linalg.norm(v) + 1e-8
+    if not np.isfinite(n) or n < 1e-5:
+        return (np.array([1.0,1.0,1.0], dtype=np.float32) / np.sqrt(3.0))
+    return (v / n).astype(np.float32)
+
+def _invert_3x3(M):
+    try:
+        return np.linalg.inv(M)
+    except np.linalg.LinAlgError:
+        return np.linalg.pinv(M)
+
+def detect_bm_color_deconv(rgb_roi, reg_roi,
+                           max_chroma=20, l_quantile=0.30,
+                           sato_sigmas=(1.0,1.5,2.0),
+                           rid_min=0.10,
+                           min_obj_px=40,
+                           prune_min_len=12,
+                           use_clahe=False):
+    """
+    Returns:
+      if PRESERVE_SINGLES_FOR_AREA=True  -> (bm_area_mask, bm_line_mask)
+      else                               -> bm_line_mask
+    """
+    H, W = rgb_roi.shape[:2]
+    if reg_roi.sum() < 25:
+        return (np.zeros((H,W), bool), np.zeros((H,W), bool)) if PRESERVE_SINGLES_FOR_AREA else np.zeros((H,W), bool)
+
+    # 1) Estimate silver OD vector
+    vS = _estimate_silver_vector(rgb_roi, reg_roi, max_chroma=max_chroma, l_quantile=l_quantile)
+
+    # Gram–Schmidt stabilize [H,E,S]
+    Hvec = _HEMA.copy(); Evec = _EOS.copy(); Svec = vS.copy()
+    Hn = Hvec / (np.linalg.norm(Hvec)+1e-8)
+    Eproj = Evec - np.dot(Evec, Hn) * Hn
+    En = Eproj / (np.linalg.norm(Eproj)+1e-8)
+    Sproj = Svec - np.dot(Svec, Hn)*Hn - np.dot(Svec, En)*En
+    if np.linalg.norm(Sproj) < 1e-6:
+        Sproj = (np.array([1.0,1.0,1.0], dtype=np.float32) / np.sqrt(3.0))
+    Snorm = Sproj / (np.linalg.norm(Sproj)+1e-8)
+
+    M = np.stack([Hn, En, Snorm], axis=1)
+    Minv = _invert_3x3(M)
+
+    # 2) Deconvolution → silver channel normalized within glomerulus
+    OD = _rgb_to_od(rgb_roi).reshape(-1,3)
+    C  = (OD @ Minv).reshape(H,W,3)
+    silver = C[:,:,2]
+    svals = silver[reg_roi]
+    svals = svals[np.isfinite(svals)]
+    if svals.size == 0:
+        return (np.zeros((H,W), bool), np.zeros((H,W), bool)) if PRESERVE_SINGLES_FOR_AREA else np.zeros((H,W), bool)
+    s_min, s_max = float(np.percentile(svals, 1)), float(np.percentile(svals, 99))
+    Sn = (silver - s_min) / (s_max - s_min + 1e-6) if s_max > s_min else silver.copy()
+
+    s_roi = Sn[reg_roi]
+    thr = threshold_otsu(s_roi) if np.any(s_roi>0) else 0.5
+    deconv_mask = (Sn >= max(thr, 0.25)) & reg_roi  # adjust 0.25 floor if desired
+
+    # 3) Ridge constraint
+    gray = cv2.cvtColor(rgb_roi, cv2.COLOR_RGB2GRAY)
+    if use_clahe:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        gray = clahe.apply(gray)
+    gray = gray.astype(np.float32)/255.0
+    rid = sato(gray, sigmas=sato_sigmas, black_ridges=True)
+    r_roi = rid[reg_roi]
+    rthr = threshold_otsu(r_roi[r_roi>0]) if np.any(r_roi>0) else rid_min
+    rid_mask = rid >= max(rthr, rid_min)
+
+    # Base BM before cleanup
+    bm_base = deconv_mask & rid_mask & reg_roi
+
+    # 4) Dual-mask logic
+    if PRESERVE_SINGLES_FOR_AREA:
+        bm_area_mask = bm_base.copy()  # keep every detected pixel for AREA (includes 1-px hits)
+
+        # Cleaned mask for SKELETON/LENGTH
+        bm_line = bm_base.copy()
+        bm_line = morphology.remove_small_objects(bm_line, min_size=min_obj_px)
+        bm_line = morphology.binary_opening(bm_line, disk(1))
+
+        # prune short spurs
+        def prune_skeleton(sk_in, passes=2, min_len=prune_min_len):
+            sk8 = sk_in.astype(np.uint8)
+            K = np.array([[1,1,1],[1,10,1],[1,1,1]], np.uint8)
+            for _ in range(passes):
+                deg = cv2.filter2D(sk8, -1, K, borderType=cv2.BORDER_CONSTANT)
+                endpoints = (sk8==1) & (deg==11)
+                lbl = measure.label(endpoints, connectivity=2)
+                for rp in measure.regionprops(lbl):
+                    r0,c0,r1,c1 = rp.bbox
+                    r0=max(r0-2,0); c0=max(c0-2,0); r1=min(r1+2,sk8.shape[0]); c1=min(c1+2,sk8.shape[1])
+                    if sk8[r0:r1, c0:c1].sum() < min_len:
+                        sk8[r0:r1, c0:c1] = 0
+            return sk8.astype(bool)
+
+        sk = morphology.skeletonize(bm_line)
+        sk = prune_skeleton(sk, passes=2, min_len=prune_min_len)
+        bm_line_mask = morphology.binary_dilation(sk, disk(1))  # visual thickness
+
+        return bm_area_mask, bm_line_mask
+    else:
+        # Original single-mask behavior
+        bm = bm_base.copy()
+        bm = morphology.remove_small_objects(bm, min_size=min_obj_px)
+        bm = morphology.binary_opening(bm, disk(1))
+
+        def prune_skeleton(sk_in, passes=2, min_len=prune_min_len):
+            sk8 = sk_in.astype(np.uint8)
+            K = np.array([[1,1,1],[1,10,1],[1,1,1]], np.uint8)
+            for _ in range(passes):
+                deg = cv2.filter2D(sk8, -1, K, borderType=cv2.BORDER_CONSTANT)
+                endpoints = (sk8==1) & (deg==11)
+                lbl = measure.label(endpoints, connectivity=2)
+                for rp in measure.regionprops(lbl):
+                    r0,c0,r1,c1 = rp.bbox
+                    r0=max(r0-2,0); c0=max(c0-2,0); r1=min(r1+2,sk8.shape[0]); c1=min(c1+2,sk8.shape[1])
+                    if sk8[r0:r1, c0:c1].sum() < min_len:
+                        sk8[r0:r1, c0:c1] = 0
+            return sk8.astype(bool)
+
+        sk = morphology.skeletonize(bm)
+        sk = prune_skeleton(sk, passes=2, min_len=prune_min_len)
+        bm = morphology.binary_dilation(sk, disk(1))
+        return bm
+
+
+def save_debug_glom_panels(sp, img, labeled, props_subset, out_dir, params):
+    os.makedirs(out_dir, exist_ok=True)
+    picks = props_subset[:8] if len(props_subset) > 8 else props_subset
+    for p in picks:
+        gid = p.label
+        r0,c0,r1,c1 = p.bbox
+        rgb_roi = img[r0:r1, c0:c1]
+        reg_roi = (labeled[r0:r1, c0:c1] == gid)
+
+        res = detect_bm_color_deconv(rgb_roi, reg_roi, **params)
+        if PRESERVE_SINGLES_FOR_AREA:
+            bm_area_mask, bm_line_mask = res
+        else:
+            bm_line_mask = res
+            bm_area_mask = bm_line_mask
+
+        g01 = cv2.cvtColor(rgb_roi, cv2.COLOR_RGB2GRAY).astype(np.float32)/255.0
+        rid = sato(g01, sigmas=params.get("sato_sigmas",(1.0,1.5,2.0)), black_ridges=True)
+
+        fig, ax = plt.subplots(1,4, figsize=(10,3))
+        ax[0].imshow(rgb_roi); ax[0].set_title("RGB"); ax[0].axis("off")
+        ax[1].imshow(rid, cmap="magma"); ax[1].set_title("Ridge"); ax[1].axis("off")
+        ax[2].imshow(bm_area_mask, cmap="gray"); ax[2].set_title("BM Mask (area)"); ax[2].axis("off")
+        over = rgb_roi.copy()
+        over[bm_line_mask] = (0,255,0)
+        ax[3].imshow(over); ax[3].set_title("Overlay (lines)"); ax[3].axis("off")
+        fig.tight_layout()
+        base = Path(sp).stem
+        fig.savefig(os.path.join(out_dir, f"{base}_gid{gid}_debug.png"), dpi=200)
+        plt.close(fig)
+
+
+import numpy as np
+
+_warned_no_mpp = {"done": False}
+def _px_area_to_um2(px_area):
+    """Convert pixel area to µm² using MPP_5X. Returns NaN if MPP_5X is None."""
+    if MPP_5X is None:
+        if not _warned_no_mpp["done"]:
+            print("[WARN] MPP_5X is None; *_um2 columns will be NaN. Set MPP_5X in Cell 2.")
+            _warned_no_mpp["done"] = True
+        return np.nan
+    return float(px_area) * (MPP_5X ** 2)
+
+
+from tqdm import tqdm
+
+# (Optional) area→µm² helper if you didn't add it earlier)
+_warned_no_mpp = {"done": False}
+def _px_area_to_um2(px_area):
+    if MPP_5X is None:
+        if not _warned_no_mpp["done"]:
+            print("[WARN] MPP_5X is None; *_um2 columns will be NaN. Set MPP_5X in Cell 2.")
+            _warned_no_mpp["done"] = True
+        return float("nan")
+    return float(px_area) * (MPP_5X ** 2)
+
+rows = []
+slides = list_images(WSI_DIR)
+print(f"Found {len(slides)} slide(s) under {WSI_DIR}")
+if len(slides) == 0:
+    raise RuntimeError("No slides found. Check mount/path or extensions.")
+
+for sp in tqdm(slides, desc="Slides"):
+    try:
+        img = read_image_any(sp)
+        mp = find_matching_mask(sp, DEST_DIR)
+        if mp is None:
+            print(f"[WARN] No matching mask for {Path(sp).name}")
+            continue
+        raw_mask = read_mask_any(mp)
+        if raw_mask.shape[:2] != img.shape[:2]:
+            raw_mask = cv2.resize(raw_mask, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        # Multi-class → binary glom 0/255
+        if MASK_IS_MULTICLASS:
+            glom = to_glom_binary(raw_mask)
+        else:
+            glom = raw_mask.astype(np.uint8)
+            if glom.ndim > 2: glom = glom[...,0]
+            glom = ((glom > 0).astype(np.uint8) * 255)
+
+        labeled = label_glomeruli(glom)
+        props = measure.regionprops(labeled)
+
+        H, W = img.shape[:2]
+        overlay = np.zeros((H, W, 3), dtype=np.uint8)
+
+        use_props = props[:MAX_GLOMS_PER_SLIDE] if (MAX_GLOMS_PER_SLIDE is not None) else props
+        p = SENS[BM_SENS_MODE]
+
+        for pr in use_props:
+            gid = pr.label
+            r0,c0,r1,c1 = pr.bbox
+            # Pad ROI
+            r0p = max(0, r0 - ROI_PAD); c0p = max(0, c0 - ROI_PAD)
+            r1p = min(H, r1 + ROI_PAD); c1p = min(W, c1 + ROI_PAD)
+
+            rgb_roi = img[r0p:r1p, c0p:c1p]
+            reg_roi = (labeled[r0p:r1p, c0p:c1p] == gid)
+
+            # Shape checks
+            area_glom_px = int(reg_roi.sum())
+            per_px = _safe_perimeter(reg_roi, getattr(pr, "perimeter", None))
+            circ = float((4.0 * math.pi * area_glom_px) / (per_px * per_px))
+            eq_diam_px = 2.0 * math.sqrt(area_glom_px / math.pi)
+            eq_diam_um = (eq_diam_px * MPP_5X) if (MPP_5X is not None) else None
+
+            area_ok = (area_glom_px >= MIN_GLOM_AREA_PX) and (area_glom_px <= MAX_GLOM_AREA_PX)
+            circ_ok = (circ >= MIN_CIRCULARITY)
+            size_ok = True
+            if (MPP_5X is not None):
+                size_ok = size_ok and (eq_diam_um >= MIN_EQ_DIAM_UM) and (eq_diam_um <= MAX_EQ_DIAM_UM)
+            shape_ok = bool(area_ok and circ_ok and size_ok)
+            if ENFORCE_SHAPE_FILTERS and (not shape_ok):
+                continue
+
+            # BM detection (now may return two masks)
+            res = detect_bm_color_deconv(rgb_roi, reg_roi, **p)
+            if PRESERVE_SINGLES_FOR_AREA:
+                bm_area_mask, bm_line_mask = res
+            else:
+                bm_line_mask = res
+                bm_area_mask = bm_line_mask
+
+            # Metrics
+            bm_in_roi_area = bm_area_mask & reg_roi
+            bm_in_roi_line = bm_line_mask & reg_roi
+
+            sk_in = morphology.skeletonize(bm_in_roi_line)
+
+            bm_area_px = int(bm_in_roi_area.sum())
+            sk_len_px  = int(sk_in.sum())
+            thickness_px = (bm_area_px / sk_len_px) if sk_len_px > 0 else 0.0
+            sk_len_um    = sk_len_px * MPP_5X if MPP_5X is not None else None
+            thickness_um = thickness_px * MPP_5X if MPP_5X is not None else None
+
+            rows.append({
+                "slide": Path(sp).name,
+                "mask": Path(mp).name,
+                "method": f"deconv+ridge:{BM_SENS_MODE}",
+                "glomerulus_id": gid,
+                "shape_pass": shape_ok,
+                "glom_area_px": area_glom_px,
+                "glom_area_um2": _px_area_to_um2(area_glom_px),
+                "glom_circularity": circ,
+                "glom_eq_diam_px": eq_diam_px,
+                "glom_eq_diam_um": eq_diam_um,
+                "bm_area_px": bm_area_px,
+                "bm_area_um2": _px_area_to_um2(bm_area_px),
+                "bm_area_frac": (bm_area_px / area_glom_px) if area_glom_px > 0 else 0.0,
+                "bm_skel_len_px": sk_len_px,
+                "bm_mean_thickness_px": thickness_px,
+                "bm_skel_len_um": sk_len_um,
+                "bm_mean_thickness_um": thickness_um
+            })
+
+            # Overlay: draw cleaned lines (optionally show singles separately)
+            ov_slice = overlay[r0p:r1p, c0p:c1p]
+            ov_slice[bm_in_roi_line] = (0, 255, 0)  # main GBM
+            # To visualize preserved singles too, uncomment:
+            # singles_only = bm_in_roi_area & (~bm_in_roi_line)
+            # ov_slice[singles_only] = (0, 180, 0)
+
+        # Save overlay with verification (PNG -> TIFF fallback)
+        ov_path_png = f"{OUT_DIR}/overlays/{Path(sp).stem}_GBMoverlay.png"
+        ok = cv2.imwrite(ov_path_png, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+        if not ok:
+            try:
+                ov_path_tif = f"{OUT_DIR}/overlays/{Path(sp).stem}_GBMoverlay.tif"
+                tiff.imwrite(ov_path_tif, overlay, photometric='rgb')
+                print(f"[OK][TIFF] {Path(sp).name} → {Path(ov_path_tif).name}")
+            except Exception as ee:
+                print(f"[ERR][SAVE] {Path(sp).name}: {ee}")
+        else:
+            print(f"[OK][PNG]  {Path(sp).name} → {Path(ov_path_png).name}")
+
+        # Debug panels (optional)
+        save_debug_glom_panels(
+            sp=sp, img=img, labeled=labeled,
+            props_subset=use_props,
+            out_dir=f"{OUT_DIR}/debug/{Path(sp).stem}",
+            params=p
+        )
+
+    except Exception as e:
+        print(f"[ERR] {Path(sp).name}: {e}")
+
+# Save CSV (unchanged)
+df = pd.DataFrame(rows)
+df.to_csv(GBM_CSV, index=False)
+print("Saved CSV:", GBM_CSV)
+print("Overlays dir:", f"{OUT_DIR}/overlays")
+print("Debug dir:", f"{OUT_DIR}/debug")
+df.head(10)
+
+
+ov_dir = f"{OUT_DIR}/overlays"
+print("Overlay dir exists:", os.path.exists(ov_dir))
+ov_files = sorted(glob.glob(os.path.join(ov_dir, "*")))
+print(f"Found {len(ov_files)} overlay files")
+for f in ov_files[:5]:
+    print("  ", Path(f).name, f"({os.path.getsize(f)/1e6:.2f} MB)")
+
+# Inline preview first overlay
+if ov_files:
+    import matplotlib.image as mpimg
+    img = mpimg.imread(ov_files[0])
+    plt.figure(figsize=(8,8)); plt.imshow(img); plt.axis('off'); plt.show()
