@@ -55,6 +55,7 @@ This pipeline runs directly in **Google Colab** — no setup required.
 ---
 
 ## 📊 Quantitative Metrics
+
 Structure	Metric	Units
 Glomerulus	Total area, tuft area, Bowman’s space area	µm²
 GBM	Mean thickness, SD thickness, perimeter	µm
@@ -63,7 +64,7 @@ Whole tissue	Fibrotic area %, nuclei count	% / n
 
 ---
 
-##🧠 Applications
+## 🧠 Applications
 
 Measurement of GBM thickening and splitting in X-Linked Alport Syndrome (XLAS) models
 
