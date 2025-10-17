@@ -1,0 +1,729 @@
+#Jones Segmentation in Colab
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip -q install "monai[tqdm]" tifffile opencv-python scikit-image imagecodecs albumentations==1.3.1
+
+
+import os, glob, shutil, numpy as np, tifffile as tiff, cv2, torch
+from tqdm import tqdm, trange
+
+# Keep project on Drive but TRAIN from local SSD for speed
+BASE_DIR       = ""   
+WSI_DIR        = f"{BASE_DIR}/WSIs"
+MASK_DIR       = f"{BASE_DIR}/Masks_Merged"
+WORK_DIR       = ""
+TILES_IMG      = f"{WORK_DIR}/tiles/images"
+TILES_MSK      = f"{WORK_DIR}/tiles/masks"
+DEST_DIR       = f"{WORK_DIR}/pred_wsis"
+
+os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(TILES_IMG, exist_ok=True)
+os.makedirs(TILES_MSK, exist_ok=True)
+
+# Train-time tiles: write uncompressed for fast reads
+FAST_IO = False
+
+
+import numpy as np, tifffile as tiff, cv2
+
+
+# Canonical order (KEEP CONSISTENT)
+CLASS_NAMES = ["Background","Glom", "PT", "DT","CollectingDuct","Vessel","NA_Cells"]
+NUM_CLASSES = len(CLASS_NAMES)
+BACKGROUND_ID = CLASS_NAMES.index("Background") # 4
+NAME2IDX = {n:i for i,n in enumerate(CLASS_NAMES)}
+
+
+# Visualization palette matching CLASS_NAMES order
+PALETTE = np.array([
+  [  0,  0,  0], # 0 Background
+  [  0,255,  0], # 1 Glom
+  [  0,  0,255], # 2 DT
+  [255,  0,255], # 3 CollectingDuct
+  [255,  0,  0], # 4 Background
+  [255,255,  0], # 5 Vessel
+  [  0,255,255], # 6 NA_Cells
+], dtype=np.uint8)
+
+
+# Labkit raw values observed (0..7). Adjust if your dataset differs.
+# Default mapping assumption:
+# 0=Background, 1=PT, 2=Glom, 3=DT, 4=CollectingDuct, 5=Vessel, 6=NA_Cells, 7=NA_Cells (fallback)
+RAW2CANON_SINGLE = {
+  0: NAME2IDX["Background"],
+  1: NAME2IDX["PT"],
+  2: NAME2IDX["Glom"],
+  3: NAME2IDX["DT"],
+  4: NAME2IDX["CollectingDuct"],
+  5: NAME2IDX["Vessel"],
+  6: NAME2IDX["NA_Cells"],
+  7: NAME2IDX["NA_Cells"], # change to BACKGROUND_ID if 7 means BG in your data
+}
+
+
+# If a subset of slides truly swaps CollectingDuct↔Vessel, list IDs here (e.g., {"001","002"}). Leave empty if not needed.
+SWAP_CD_VESSEL_SIDS = set()
+
+
+
+
+def to_hwc3(img: np.ndarray) -> np.ndarray:
+  if img.ndim == 2:
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+  elif img.ndim == 3:
+    if img.shape[0] in (3,4) and img.shape[-1] not in (3,4): # C,H,W → H,W,C
+      img = np.transpose(img, (1,2,0))
+    if img.shape[-1] > 3: img = img[..., :3]
+    if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+  return np.clip(img, 0, 255).astype(np.uint8)
+
+
+
+
+def sanitize_labels_raw(arr: np.ndarray, slide_id: str) -> np.ndarray:
+  """Map Labkit raw 0..7 → canonical 0..6, optionally flip CDuct/Vessel per slide."""
+  lut = np.full(256, BACKGROUND_ID, dtype=np.uint8)
+  for raw, canon in RAW2CANON_SINGLE.items():
+    lut[raw] = canon
+  out = lut[np.clip(arr.squeeze().astype(np.int32), 0, 255)]
+  if slide_id in SWAP_CD_VESSEL_SIDS:
+    cd, vs = NAME2IDX["CollectingDuct"], NAME2IDX["Vessel"]
+    tmp = 255
+    out = np.where(out == cd, tmp, out)
+    out = np.where(out == vs, cd, out)
+    out = np.where(out == tmp, vs, out).astype(np.uint8)
+  return out
+
+from tqdm import tqdm
+
+
+def base_id(p: str) -> str:
+  n = os.path.basename(p)
+  return n[:-5] if n.lower().endswith('.tiff') else n[:-4]
+
+
+wsis = {base_id(p): p for p in (glob.glob(f"{WSI_DIR}/*.tif") + glob.glob(f"{WSI_DIR}/*.tiff"))}
+m_raw = {base_id(p): p for p in (glob.glob(f"{MASK_DIR}/*.tif") + glob.glob(f"{MASK_DIR}/*.tiff"))}
+sids = sorted(set(wsis) & set(m_raw))
+assert sids, "No overlapping slide IDs. Check WSI_DIR/MASK_DIR."
+print("Slides overlapping:", len(sids), sids)
+
+
+MASK_ALIGNED_DIR = f"{BASE_DIR}/Masks_Aligned"
+os.makedirs(MASK_ALIGNED_DIR, exist_ok=True)
+
+
+
+
+def align_one_slide(sid: str, tol_aspect: float = 1e-3) -> str:
+  wp, mp = wsis[sid], m_raw[sid]
+  wsi = to_hwc3(tiff.imread(wp))
+  y_raw = tiff.imread(mp).squeeze()
+  y = sanitize_labels_raw(y_raw, sid)
+  H, W = wsi.shape[:2]
+  h, w = y.shape[:2]
+  ar_w, ar_m = W/float(H), w/float(h)
+  if abs(ar_w - ar_m) > tol_aspect:
+    print(f"[WARN] {sid}: aspect mismatch (img {H}x{W} vs mask {h}x{w}). Resizing anyway; verify overlays.")
+  if (h, w) != (H, W):
+    y = cv2.resize(y, (W, H), interpolation=cv2.INTER_NEAREST)
+  outp = os.path.join(MASK_ALIGNED_DIR, f"{sid}.tif")
+  tiff.imwrite(outp, y.astype(np.uint8), compression='zlib')
+  return outp
+
+
+print("Aligning Labkit masks → WSI grid …")
+for sid in tqdm(sids):
+  align_one_slide(sid)
+
+
+# Point downstream to aligned masks
+masks = {base_id(p): p for p in glob.glob(f"{MASK_ALIGNED_DIR}/*.tif")}
+print(f"Aligned masks ready: {len(masks)} @ {MASK_ALIGNED_DIR}")
+
+import numpy as np
+
+
+# Clean old tiles
+for d in [TILES_IMG, TILES_MSK]:
+  shutil.rmtree(d, ignore_errors=True)
+  os.makedirs(d, exist_ok=True)
+
+
+TILE = 512
+OVERLAP = 128
+STEP = TILE - OVERLAP
+OFFSETS = [(0,0), (TILE//2, TILE//2)]
+
+
+
+
+def tile_one(sid: str) -> int:
+  img = to_hwc3(tiff.imread(wsis[sid]))
+  msk = tiff.imread(masks[sid]).squeeze()
+  H = min(img.shape[0], msk.shape[0]); W = min(img.shape[1], msk.shape[1])
+  img, msk = img[:H, :W], msk[:H, :W]
+  wrote = 0
+  for oy, ox in OFFSETS:
+    y0 = int(np.clip(oy, 0, max(0, H-1)))
+    x0 = int(np.clip(ox, 0, max(0, W-1)))
+    for y in range(y0, H, STEP):
+      for x in range(x0, W, STEP):
+        yy, xx = min(y+TILE, H), min(x+TILE, W)
+        ti, tm = img[y:yy, x:xx], msk[y:yy, x:xx]
+        if ti.shape[0] < TILE or ti.shape[1] < TILE:
+          ti = np.pad(ti, ((0, TILE-ti.shape[0]), (0, TILE-ti.shape[1]), (0,0)), mode='constant')
+          tm = np.pad(tm, ((0, TILE-tm.shape[0]), (0, TILE-tm.shape[1])), mode='constant', constant_values=BACKGROUND_ID)
+        name = f"{sid}_{oy}_{ox}_{y}_{x}.tif"
+        tiff.imwrite(os.path.join(TILES_IMG, name), ti, compression=(None if FAST_IO else 'zlib'))
+        tiff.imwrite(os.path.join(TILES_MSK, name), tm.astype(np.uint8), compression=(None if FAST_IO else 'zlib'))
+        wrote += 1
+  return wrote
+
+
+print("Tiling (multi-offset) …")
+count = 0
+for sid in tqdm(sids):
+  count += tile_one(sid)
+print("Total tiles written:", count)
+
+# ===== Recovery Cell — define JonesTiles and rebuild DataLoaders (CPU/GPU safe) =====
+import os, glob, numpy as np, tifffile as tiff, cv2, torch
+import albumentations as A
+from torch.utils.data import Dataset, DataLoader
+
+# Preconditions: tiles must exist
+assert 'TILES_IMG' in globals() and 'TILES_MSK' in globals(), "Run the tiling cells first to create tiles."
+
+# Pair tiles strictly by basename
+img_map = {os.path.basename(p): p for p in glob.glob(f"{TILES_IMG}/*.tif")}
+msk_map = {os.path.basename(p): p for p in glob.glob(f"{TILES_MSK}/*.tif")}
+common  = sorted(set(img_map) & set(msk_map))
+assert common, "No paired tiles found; check tiling paths and rerun tiling."
+all_imgs = [img_map[k] for k in common]
+all_msks = [msk_map[k] for k in common]
+assert all(os.path.basename(a)==os.path.basename(b) for a,b in zip(all_imgs, all_msks)), "Pairing mismatch."
+print("Paired tiles:", len(all_imgs))
+
+# Slide-level split (75/25 by slide id)
+def slide_of(p: str) -> str:
+    return os.path.basename(p).split("_")[0]
+
+by_slide = {}
+for i, p in enumerate(all_imgs):
+    by_slide.setdefault(slide_of(p), []).append(i)
+
+slide_ids = sorted(by_slide)
+cut = max(1, int(0.75 * len(slide_ids)))
+tr_sids, va_sids = slide_ids[:cut], slide_ids[cut:]
+train_idx = sum([by_slide[s] for s in tr_sids], [])
+val_idx   = sum([by_slide[s] for s in va_sids],  [])
+print(f"Slides → train:{len(tr_sids)}  val:{len(va_sids)}")
+
+# Augs (same as before)
+aug = A.Compose([
+    A.HorizontalFlip(p=0.5), A.VerticalFlip(p=0.5), A.RandomRotate90(p=0.5),
+    A.ColorJitter(0.08, 0.08, 0.08, 0.03, p=0.5)
+], is_check_shapes=False)
+
+# Dataset definition
+class JonesTiles(Dataset):
+    def __init__(self, idxs, aug=None):
+        self.idxs, self.aug = idxs, aug
+    def __len__(self): return len(self.idxs)
+    def __getitem__(self, k):
+        i = self.idxs[k]
+        x = tiff.imread(all_imgs[i])
+        if x.ndim == 2:
+            x = cv2.cvtColor(x, cv2.COLOR_GRAY2RGB)
+        elif x.shape[-1] > 3:
+            x = x[..., :3]
+        y = tiff.imread(all_msks[i]).astype(np.uint8)
+        if self.aug is not None:
+            out = self.aug(image=x, mask=y); x, y = out["image"], out["mask"]
+        x = (x.astype(np.float32) / 255.).transpose(2, 0, 1)
+        y = y.astype(np.int64)
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+# DataLoaders (robust on CPU/GPU)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+BATCH = 32 if device.type == "cuda" else 6
+num_workers = 16 if device.type == "cuda" else 0   # set >0 on CPU if you want multiprocessing
+pin_memory  = (device.type == "cuda")
+
+tr_kwargs = dict(batch_size=BATCH, shuffle=True,  num_workers=num_workers, pin_memory=pin_memory, drop_last=True)
+va_kwargs = dict(batch_size=BATCH, shuffle=False, num_workers=num_workers, pin_memory=pin_memory, drop_last=False)
+if num_workers > 0:
+    tr_kwargs.update(prefetch_factor=4, persistent_workers=True)
+    va_kwargs.update(prefetch_factor=4, persistent_workers=True)
+
+tr_dl = DataLoader(JonesTiles(train_idx, aug), **tr_kwargs)
+va_dl = DataLoader(JonesTiles(val_idx,  None), **va_kwargs)
+
+# Sanity peek
+xb, yb = next(iter(tr_dl))
+print("Train batch:", tuple(xb.shape), "| label range:", int(yb.min()), int(yb.max()), "| num_workers:", num_workers)
+
+
+# =============================
+# Cell 6 — Model and milder PRIORITIZED CE weights (no compile)
+# =============================
+import torch, torch.nn as nn
+from monai.networks.nets import UNet
+import numpy as np
+
+# Speed toggles
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision('high')
+except Exception:
+    pass
+
+print("Using device:", device)
+
+model = UNet(
+    spatial_dims=2, in_channels=3, out_channels=NUM_CLASSES,
+    channels=(32,64,128,256,512), strides=(2,2,2,2)
+).to(device).to(memory_format=torch.channels_last)
+
+# (Rolled back) — keep it uncompiled for clean checkpoints and stable load
+# If you really want compile later, add it back and use the robust load shim in Cell 8.
+# try:
+#     model = torch.compile(model, mode="max-autotune")
+#     print("Model compiled with torch.compile")
+# except Exception as e:
+#     print("compile skipped:", e)
+
+# ---- PRIORITY: milder boosts for PT/Glom/DT; NO BG down-weight ----
+PRIORITY_MULT = {
+    "PT":   1.5,
+    "Glom": 2.0,
+    "DT":   1.5,
+    # others default to 1.0 below
+}
+BACKGROUND_MULT = 1.0  # rolled back from 0.5
+
+# Build frequency-based weights then apply multipliers (sample subset for speed)
+sample_idx = train_idx[::max(1, len(train_idx)//300)] if train_idx else []
+freq = np.zeros(NUM_CLASSES, dtype=np.int64)
+for i in sample_idx:
+    y = tiff.imread(all_msks[i]).squeeze().astype(np.uint8)
+    b = np.bincount(y.ravel(), minlength=NUM_CLASSES)
+    freq += b
+if freq.sum() == 0:
+    freq[:] = 1
+
+# Inverse-log weighting
+ce_w = 1.0 / np.log(1.02 + (freq / float(freq.sum())))
+ce_w = ce_w.astype(np.float32)
+
+# Apply class priority and BG multiplier
+for k, v in PRIORITY_MULT.items():
+    ce_w[NAME2IDX[k]] *= float(v)
+ce_w[BACKGROUND_ID] *= float(BACKGROUND_MULT)
+
+# Normalize to mean=1 for stability
+ce_w /= max(1e-8, ce_w.mean())
+print("CE weights:", {CLASS_NAMES[i]: float(np.round(ce_w[i],3)) for i in range(NUM_CLASSES)})
+
+ce_loss = nn.CrossEntropyLoss(weight=torch.tensor(ce_w, device=device))
+
+def total_loss(logits, y):  # logits: [B,C,H,W], y: [B,H,W]
+    return ce_loss(logits, y)
+
+opt   = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    opt, mode="max", factor=0.5, patience=4, min_lr=1e-6, verbose=True
+)
+scaler = torch.amp.GradScaler(enabled=(device.type=='cuda'))
+
+
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def dice_per_class_gpu(pred, true, num_classes, eps=1e-8):
+  po = F.one_hot(pred, num_classes).permute(0,3,1,2).float()
+  to = F.one_hot(true, num_classes).permute(0,3,1,2).float()
+  inter = (po*to).sum(dim=(0,2,3)) * 2.0
+  denom = po.sum(dim=(0,2,3)) + to.sum(dim=(0,2,3)) + eps
+  return inter / denom # [C]
+
+
+MAX_EPOCHS = 60
+best_macro_bg, best_path, stale = 0.0, os.path.join(WORK_DIR, "unet_jones_best.pt"), 0
+
+
+from tqdm import trange
+for epoch in trange(1, MAX_EPOCHS+1, desc="Epoch"):
+  model.train(); tloss=0.0; seen=0
+  for x,y in tqdm(tr_dl, leave=False, desc=f"Train {epoch}"):
+    x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+    y = y.to(device, non_blocking=True).long()
+    with torch.amp.autocast(device_type='cuda', enabled=(device.type=='cuda')):
+      logits = model(x)
+      loss = total_loss(logits, y)
+    scaler.scale(loss).backward()
+    scaler.step(opt); scaler.update()
+    opt.zero_grad(set_to_none=True)
+    tloss += loss.item() * x.size(0); seen += x.size(0)
+  tloss /= max(1, seen)
+
+
+# Validation
+  model.eval(); md_bg=[]; pcs=[]
+  with torch.inference_mode():
+    for x,y in va_dl:
+      x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+      y = y.to(device).long()
+      with torch.amp.autocast(device_type='cuda', enabled=(device.type=='cuda')):
+        pr = torch.argmax(model(x), dim=1)
+      d = dice_per_class_gpu(pr, y, NUM_CLASSES)
+      md_bg.append(d.mean().item()); pcs.append(d.detach().cpu().numpy())
+  macro_bg = float(np.mean(md_bg)) if md_bg else 0.0
+  pcs_mean = np.mean(np.stack(pcs), axis=0) if pcs else np.zeros(NUM_CLASSES)
+
+
+  sched.step(macro_bg)
+  print(f"Epoch {epoch:02d} | train_loss={tloss:.4f} | VAL macro Dice (with BG)={macro_bg:.3f}")
+  print("Per-class Dice:", {CLASS_NAMES[i]: float(np.round(pcs_mean[i],3)) for i in range(NUM_CLASSES)})
+
+
+  if macro_bg > best_macro_bg:
+    best_macro_bg, stale = macro_bg, 0
+    torch.save(model.state_dict(), best_path); print(f"** saved best (macro={best_macro_bg:.3f}) → {best_path}")
+  else:
+    stale += 1
+    if stale >= 8:
+      print("Early stop."); break
+
+
+if not os.path.exists(best_path):
+  torch.save(model.state_dict(), best_path)
+  print(f"[WARN] No improving checkpoint; saved current model to {best_path}")
+else:
+  print("[OK] Best checkpoint:", best_path)
+
+# import torch.nn.functional as F
+# def soft_dice_excl_bg(logits, y, bg_idx=BACKGROUND_ID, eps=1e-6):
+#     C = logits.shape[1]
+#     p = torch.softmax(logits, dim=1)
+#     t = F.one_hot(y, C).permute(0,3,1,2).float()
+#     keep = [i for i in range(C) if i != bg_idx]
+#     p, t = p[:, keep], t[:, keep]
+#     inter = (p*t).sum(dim=(0,2,3))*2.0
+#     denom = p.sum(dim=(0,2,3)) + t.sum(dim=(0,2,3)) + eps
+#     return 1.0 - (inter/denom).mean()
+# LAMBDA_DICE = 0.2
+# def total_loss(logits, y):
+#     return ce_loss(logits, y) + LAMBDA_DICE*soft_dice_excl_bg(logits, y)
+
+# @torch.no_grad()
+# def dice_per_class_gpu(pred, true, num_classes, eps=1e-8):
+#   po = F.one_hot(pred, num_classes).permute(0,3,1,2).float()
+#   to = F.one_hot(true, num_classes).permute(0,3,1,2).float()
+#   inter = (po*to).sum(dim=(0,2,3)) * 2.0
+#   denom = po.sum(dim=(0,2,3)) + to.sum(dim=(0,2,3)) + eps
+#   return inter / denom # [C]
+
+
+# MAX_EPOCHS = 60
+# best_macro_bg, best_path, stale = 0.0, os.path.join(WORK_DIR, "unet_jones_best.pt"), 0
+
+
+# from tqdm import trange
+# for epoch in trange(1, MAX_EPOCHS+1, desc="Epoch"):
+#   model.train(); tloss=0.0; seen=0
+#   for x,y in tqdm(tr_dl, leave=False, desc=f"Train {epoch}"):
+#     x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+#     y = y.to(device, non_blocking=True).long()
+#     with torch.amp.autocast(device_type='cuda', enabled=(device.type=='cuda')):
+#       logits = model(x)
+#       loss = total_loss(logits, y)
+#     scaler.scale(loss).backward()
+#     scaler.step(opt); scaler.update()
+#     opt.zero_grad(set_to_none=True)
+#     tloss += loss.item() * x.size(0); seen += x.size(0)
+#   tloss /= max(1, seen)
+
+
+# # Validation
+#   model.eval(); md_bg=[]; pcs=[]
+#   with torch.inference_mode():
+#     for x,y in va_dl:
+#       x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+#       y = y.to(device).long()
+#       with torch.amp.autocast(device_type='cuda', enabled=(device.type=='cuda')):
+#         pr = torch.argmax(model(x), dim=1)
+#       d = dice_per_class_gpu(pr, y, NUM_CLASSES)
+#       md_bg.append(d.mean().item()); pcs.append(d.detach().cpu().numpy())
+#   macro_bg = float(np.mean(md_bg)) if md_bg else 0.0
+#   pcs_mean = np.mean(np.stack(pcs), axis=0) if pcs else np.zeros(NUM_CLASSES)
+
+
+#   sched.step(macro_bg)
+#   print(f"Epoch {epoch:02d} | train_loss={tloss:.4f} | VAL macro Dice (with BG)={macro_bg:.3f}")
+#   print("Per-class Dice:", {CLASS_NAMES[i]: float(np.round(pcs_mean[i],3)) for i in range(NUM_CLASSES)})
+
+
+#   if macro_bg > best_macro_bg:
+#     best_macro_bg, stale = macro_bg, 0
+#     torch.save(model.state_dict(), best_path); print(f"** saved best (macro={best_macro_bg:.3f}) → {best_path}")
+#   else:
+#     stale += 1
+#     if stale >= 12:
+#       print("Early stop."); break
+
+
+# if not os.path.exists(best_path):
+#   torch.save(model.state_dict(), best_path)
+#   print(f"[WARN] No improving checkpoint; saved current model to {best_path}")
+# else:
+#   print("[OK] Best checkpoint:", best_path)
+
+# =============================
+# Cell 8 — Adaptive inference (GPU or CPU), robust checkpoint load
+# =============================
+import os, gc, glob, numpy as np, tifffile as tiff, cv2, torch
+from tqdm import tqdm
+from monai.networks.nets import UNet
+
+# --- device & paths (use existing globals if present) ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Fallbacks if not defined earlier
+WORK_DIR = WORK_DIR if 'WORK_DIR' in globals() else "/content/kidney_seg/jones_seg/Work/MONAI_JONES"
+WSI_DIR  = WSI_DIR  if 'WSI_DIR'  in globals() else "/content/kidney_seg/jones_seg/WSIs"
+if 'MASK_ALIGNED_DIR' in globals():
+    MASK_ALIGNED_DIR = MASK_ALIGNED_DIR
+elif 'BASE_DIR' in globals():
+    MASK_ALIGNED_DIR = f"{BASE_DIR}/Masks_Aligned"
+else:
+    MASK_ALIGNED_DIR = "/content/kidney_seg/jones_seg/Masks_Aligned"
+
+best_path = best_path if 'best_path' in globals() else os.path.join(WORK_DIR, "unet_jones_best.pt")
+
+# Helper fallback(s)
+if 'to_hwc3' not in globals():
+    def to_hwc3(img: np.ndarray) -> np.ndarray:
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+        elif img.ndim == 3:
+            if img.shape[0] in (3,4) and img.shape[-1] not in (3,4):
+                img = np.transpose(img, (1,2,0))  # C,H,W -> H,W,C
+            if img.shape[-1] > 3: img = img[..., :3]
+            if img.shape[-1] == 1: img = np.repeat(img, 3, axis=-1)
+        return np.clip(img, 0, 255).astype(np.uint8)
+
+assert 'NUM_CLASSES' in globals(), "Define NUM_CLASSES before running Cell 8."
+
+if 'PALETTE' not in globals():
+    PALETTE = np.array([
+        [  0,  0,  0],   # 0 Background
+        [  0,255,  0],   # 1 Glom
+        [  0,  0,255],   # 2 PT
+        [255,  0,255],   # 3 DT
+        [255,  0,  0],   # 4 CollectingDuct
+        [255,255,  0],   # 5 Vessel
+        [  0,255,255],   # 6 NA_Cells
+    ], dtype=np.uint8)
+
+# --- free training loaders/graphs to lower VRAM before inference ---
+for var in ['tr_dl','va_dl']:
+    if var in globals():
+        try: del globals()[var]
+        except: pass
+gc.collect()
+if device.type == 'cuda':
+    torch.cuda.empty_cache()
+
+# --- fresh, uncompiled model for inference (smaller memory footprint) ---
+infer_model = UNet(
+    spatial_dims=2, in_channels=3, out_channels=NUM_CLASSES,
+    channels=(32,64,128,256,512), strides=(2,2,2,2)
+).to(device).eval()
+
+# ---- robust load: strip wrapper prefixes like "_orig_mod." (torch.compile) and "module." (DataParallel) ----
+sd = torch.load(best_path, map_location="cpu")
+
+# Some saves wrap the state dict under a "state_dict" key
+if isinstance(sd, dict) and 'state_dict' in sd and all(isinstance(k, str) for k in sd['state_dict'].keys()):
+    sd = sd['state_dict']
+
+def _strip_prefix(sd_dict, prefix):
+    if any(k.startswith(prefix) for k in sd_dict.keys()):
+        sd_dict = { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in sd_dict.items() }
+    return sd_dict
+
+sd = _strip_prefix(sd, "_orig_mod.")
+sd = _strip_prefix(sd, "module.")
+infer_model.load_state_dict(sd, strict=True)
+infer_model.to(device)
+
+DEST_DIR = f"{WORK_DIR}/pred_wsis"
+os.makedirs(DEST_DIR, exist_ok=True)
+
+def colorize_mask(label_2d: np.ndarray) -> np.ndarray:
+    lab = np.clip(label_2d.astype(np.int64), 0, PALETTE.shape[0]-1)
+    return PALETTE[lab]
+
+def _pick_gpu_batch_tiles(tile: int, num_classes: int, cap: int = 64, safety: float = 0.75) -> int:
+    """Heuristic batch sizer using free VRAM (FP16)."""
+    if device.type != 'cuda':
+        return 1
+    free_bytes, _ = torch.cuda.mem_get_info()
+    # approx bytes per tile for fp16: input (3*T*T) + logits (C*T*T); add headroom
+    bytes_per_tile = (3*tile*tile + num_classes*tile*tile) * 2
+    bytes_per_tile = int(bytes_per_tile * 1.3)
+    est = max(1, int((free_bytes * safety) // bytes_per_tile))
+    return max(1, min(est, cap))
+
+def overlay_masked(wsi_u8: np.ndarray, rgb_u8: np.ndarray, pred_u8: np.ndarray, bg_idx: int, alpha: float = 0.35) -> np.ndarray:
+    """Blend only on non-background pixels."""
+    wsi_f = wsi_u8.astype(np.float32)
+    rgb_f = rgb_u8.astype(np.float32)
+    out   = wsi_f.copy()
+    mask  = (pred_u8 != bg_idx)
+    out[mask] = (1.0 - alpha) * wsi_f[mask] + alpha * rgb_f[mask]
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+@torch.inference_mode()
+def infer_wsi_adaptive(slide_id: str, GPU_TILE=1024, GPU_OVERLAP=256, CPU_TILE=512, CPU_OVERLAP=256, start_batch=32):
+    # choose params by device
+    if device.type == 'cuda':
+        TILE, OVERLAP = GPU_TILE, GPU_OVERLAP
+        BATCH_TILES   = _pick_gpu_batch_tiles(GPU_TILE, NUM_CLASSES, cap=max(1, start_batch))
+        use_half      = True
+    else:
+        TILE, OVERLAP = CPU_TILE, CPU_OVERLAP
+        BATCH_TILES   = 2
+        use_half      = False
+
+    print(f"[{slide_id}] dev={device.type} TILE={TILE} OVERLAP={OVERLAP} BATCH_TILES={BATCH_TILES}")
+
+    # paths & shapes
+    wsi_path = os.path.join(WSI_DIR,  f"{slide_id}.tif")
+    if not os.path.exists(wsi_path): wsi_path = os.path.join(WSI_DIR,  f"{slide_id}.tiff")
+    msk_path = os.path.join(MASK_ALIGNED_DIR, f"{slide_id}.tif")
+
+    img = to_hwc3(tiff.imread(wsi_path))
+    H, W = tiff.imread(msk_path).squeeze().shape[:2]
+    img = img[:H, :W]
+
+    STEP = TILE - OVERLAP
+    prob = np.zeros((NUM_CLASSES, H, W), dtype=np.float32)
+    wacc = np.zeros((H, W), dtype=np.float32)
+    win  = np.outer(np.hanning(TILE), np.hanning(TILE)).astype(np.float32)
+    win  = (win - win.min())/(win.max()-win.min()+1e-8) + 1e-3
+
+    coords = [(y, x) for y in range(0, H, STEP) for x in range(0, W, STEP)]
+    tiles_np = np.empty((BATCH_TILES, 3, TILE, TILE), dtype=np.float32)
+    pads = [None] * BATCH_TILES
+
+    for i in tqdm(range(0, len(coords), BATCH_TILES), desc=f"Infer {slide_id}"):
+        batch = coords[i:i+BATCH_TILES]
+
+        # build batch
+        for j, (y, x) in enumerate(batch):
+            t = img[y:y+TILE, x:x+TILE]
+            pad = ((0,0),(0,0),(0,0))
+            if t.shape[0] < TILE or t.shape[1] < TILE:
+                pad = ((0, TILE - t.shape[0]), (0, TILE - t.shape[1]), (0,0))
+                t = np.pad(t, pad, mode='constant')
+            tiles_np[j] = (t.astype(np.float32)/255.).transpose(2, 0, 1)
+            pads[j] = pad
+
+        # to device (fp16 on GPU)
+        xt = torch.from_numpy(tiles_np[:len(batch)]).to(device, non_blocking=True)
+        if use_half: xt = xt.half()
+        xt = xt.contiguous(memory_format=torch.channels_last)
+
+        # forward with OOM-resilient retry
+        try:
+            if device.type == 'cuda':
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = infer_model(xt)
+                    prs = torch.softmax(logits, dim=1).float().cpu().numpy()
+            else:
+                logits = infer_model(xt)
+                prs = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        except RuntimeError as e:
+            if device.type == 'cuda' and 'out of memory' in str(e).lower() and len(batch) > 1:
+                torch.cuda.empty_cache()
+                half = max(1, len(batch)//2)
+                print(f"GPU OOM at batch={len(batch)}; retrying with {half}")
+                for k in range(0, len(batch), half):
+                    sub = batch[k:k+half]
+                    xt_sub = torch.from_numpy(tiles_np[:len(sub)]).to(device, non_blocking=True).half().contiguous(memory_format=torch.channels_last)
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        logits = infer_model(xt_sub)
+                        prs_sub = torch.softmax(logits, dim=1).float().cpu().numpy()
+                    for (y,x), pr, pad in zip(sub, prs_sub, pads):
+                        h = TILE - pad[0][1]; w = TILE - pad[1][1]
+                        winc = win[:h,:w]
+                        prob[:, y:y+h, x:x+w] += pr[:, :h, :w] * winc
+                        wacc[y:y+h, x:x+w]    += winc
+                    del xt_sub, logits, prs_sub
+                    torch.cuda.empty_cache()
+                del xt
+                continue
+            else:
+                raise
+
+        # stitch
+        for (y,x), pr, pad in zip(batch, prs, pads):
+            h = TILE - pad[0][1]; w = TILE - pad[1][1]
+            winc = win[:h,:w]
+            prob[:, y:y+h, x:x+w] += pr[:, :h, :w] * winc
+            wacc[y:y+h, x:x+w]    += winc
+
+        del xt, logits
+        if device.type == 'cuda': torch.cuda.empty_cache()
+        else: gc.collect()
+
+    # normalize & save
+    wacc[wacc == 0] = 1.0
+    pred = np.argmax(prob / wacc[None], axis=0).astype(np.uint8)
+
+    out_pred = os.path.join(DEST_DIR, f"{slide_id}_pred.tif")
+    tiff.imwrite(out_pred, pred, compression='zlib')
+    rgb = colorize_mask(pred)
+    tiff.imwrite(os.path.join(DEST_DIR, f"{slide_id}_pred_rgb.tif"), rgb, compression='zlib')
+
+    # overlay
+    wsi = to_hwc3(tiff.imread(wsi_path))
+    if wsi.shape[:2] != pred.shape:
+        wsi = cv2.resize(wsi, (pred.shape[1], pred.shape[0]), interpolation=cv2.INTER_AREA)
+
+    overlay = overlay_masked(wsi, rgb, pred, bg_idx=BACKGROUND_ID, alpha=0.35)
+    tiff.imwrite(os.path.join(DEST_DIR, f"{slide_id}_overlay.tif"), overlay, compression='zlib')
+
+    u, c = np.unique(pred, return_counts=True)
+    print(f"{slide_id} uniques:", dict(zip(u.tolist(), c.tolist())))
+    print("Saved:", out_pred)
+
+# --- run on all slides present in aligned-mask dir ---
+if 'sids' in globals():
+    slide_ids = sorted(sids)
+else:
+    slide_ids = sorted({os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(MASK_ALIGNED_DIR, "*.tif"))})
+
+for sid in slide_ids:
+    infer_wsi_adaptive(sid, GPU_TILE=1024, GPU_OVERLAP=256, CPU_TILE=512, CPU_OVERLAP=256, start_batch=32)
+
+# --- global predicted distribution ---
+tot = np.zeros(NUM_CLASSES, dtype=np.int64)
+for pp in sorted(glob.glob(os.path.join(DEST_DIR, "*_pred.tif"))):
+    y = tiff.imread(pp).squeeze()
+    b = np.bincount(y.ravel(), minlength=NUM_CLASSES); tot += b
+
+print("\n--- Global predicted distribution ---")
+N = int(tot.sum()) if int(tot.sum())>0 else 1
+for i, n in enumerate(tot):
+    name = CLASS_NAMES[i] if 'CLASS_NAMES' in globals() else str(i)
+    pct = (n/N*100.0)
+    print(f"{i:2d} {name:16s} {int(n):>10d} ({pct:.3f}%)")
