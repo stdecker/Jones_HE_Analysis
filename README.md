@@ -54,7 +54,7 @@ This pipeline runs directly in **Google Colab** — no setup required.
 
 ---
 
-##📊 Quantitative Metrics
+## 📊 Quantitative Metrics
 Structure	Metric	Units
 Glomerulus	Total area, tuft area, Bowman’s space area	µm²
 GBM	Mean thickness, SD thickness, perimeter	µm
@@ -77,7 +77,7 @@ Standardized morphometry aligned with AJP-Renal and Kidney International methods
 
 ---
 
-##🧾 Citation
+## 🧾 Citation
 
 If you use this pipeline in your research, please cite:
 
